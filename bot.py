@@ -6,7 +6,7 @@ import threading
 import time
 from queue import Queue
 from flask import Flask, request
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from datetime import datetime
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = str(os.getenv("ADMIN_ID", "0")).strip()
@@ -14,18 +14,36 @@ ADMIN_ID = str(os.getenv("ADMIN_ID", "0")).strip()
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=False)
 app = Flask(__name__)
 
+# ================================
+# FILES
+# ================================
 ROUTE_FILE = "routes.json"
-SESSION_FILE = "sessions.json"
+REGISTRY_FILE = "vault_registry.json"
 
 recent_relays = set()
 route_queues = {}
 route_workers = {}
-user_sessions = {}
 
-# ==============================
-# FILE LOAD / SAVE SYSTEM
-# ==============================
+# ================================
+# FIXED DESTINATIONS
+# ================================
+BACKUP_CHAT_ID = -1003784514496
+BACKUP_TOPIC_ID = 841
 
+VAULT_CHAT_ID = -1003967178737
+ADMIN_LOG_TOPIC_ID = 1101
+
+# VAULT INSTITUTE TOPICS
+VAULT_TOPICS = {
+    "clinicalguruji": 343,
+    "mist": 6,
+    "bellum": 7,
+    "pw": 9
+}
+
+# ================================
+# LOAD / SAVE ROUTES
+# ================================
 def load_routes():
     try:
         with open(ROUTE_FILE, "r", encoding="utf-8") as f:
@@ -37,110 +55,140 @@ def save_routes(routes):
     with open(ROUTE_FILE, "w", encoding="utf-8") as f:
         json.dump(routes, f, indent=4)
 
-def load_sessions():
-    try:
-        with open(SESSION_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return {int(k): v for k, v in data.items()}
-    except:
-        return {}
-
-def save_sessions():
-    with open(SESSION_FILE, "w", encoding="utf-8") as f:
-        json.dump({str(k): v for k, v in user_sessions.items()}, f, indent=4)
-
 ROUTES = load_routes()
-user_sessions = load_sessions()
 
-# ==============================
+# ================================
+# LOAD / SAVE REGISTRY DATABASE
+# ================================
+def load_registry():
+    try:
+        with open(REGISTRY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return []
+
+def save_registry(data):
+    with open(REGISTRY_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+VAULT_REGISTRY = load_registry()
+
+# ================================
 # ADMIN CHECK
-# ==============================
-
+# ================================
 def is_admin(message):
     return True
 
-# ==============================
-# CONTROL PANEL UI
-# ==============================
-
-def main_panel():
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("➕ Add Route", callback_data="addroute"),
-        InlineKeyboardButton("📡 View Routes", callback_data="viewroutes"),
-        InlineKeyboardButton("⏯ Toggle Route", callback_data="toggle"),
-        InlineKeyboardButton("🗑 Delete Route", callback_data="delete"),
-        InlineKeyboardButton("📝 Caption Mode", callback_data="caption"),
-        InlineKeyboardButton("📊 Log Panel", callback_data="stats")
-    )
-    return kb
-
-# ==============================
-# ROUTE ENGINE HELPERS
-# ==============================
-
+# ================================
+# ROUTE KEY
+# ================================
 def get_route_key(route):
     return f"{route['source_chat']}_{route['source_topic']}_{route['dest_chat']}_{route['dest_topic']}"
 
+# ================================
+# SAFE TELEGRAM LINK GENERATOR
+# ================================
+def generate_private_link(chat_id, message_id):
+    try:
+        clean_chat = str(chat_id).replace("-100", "")
+        return f"https://t.me/c/{clean_chat}/{message_id}"
+    except:
+        return "LINK_ERROR"
+
+# ================================
+# ADMIN LOG SENDER
+# ================================
+def send_admin_log(text):
+    try:
+        bot.send_message(
+            chat_id=VAULT_CHAT_ID,
+            text=text,
+            message_thread_id=ADMIN_LOG_TOPIC_ID
+        )
+    except Exception as e:
+        print("Admin log send error:", e)
+
+# ================================
+# REGISTRY LOGGER
+# ================================
+def log_to_registry(original_message, route, sent_message):
+    global VAULT_REGISTRY
+
+    try:
+        file_caption = original_message.caption if hasattr(original_message, "caption") and original_message.caption else ""
+        if not file_caption and hasattr(original_message, "text"):
+            file_caption = original_message.text or ""
+
+        entry = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "source_chat": original_message.chat.id,
+            "source_topic": getattr(original_message, "message_thread_id", None),
+            "source_message_id": original_message.message_id,
+            "dest_chat": route["dest_chat"],
+            "dest_topic": route["dest_topic"],
+            "dest_message_id": sent_message.message_id,
+            "caption": file_caption,
+            "vault_link": generate_private_link(route["dest_chat"], sent_message.message_id)
+        }
+
+        VAULT_REGISTRY.append(entry)
+        save_registry(VAULT_REGISTRY)
+
+        log_text = (
+            f"✅ <b>NEW FILE STORED</b>\n"
+            f"📝 <b>Caption:</b> {file_caption[:80]}\n"
+            f"📦 <b>Vault Topic:</b> {route['dest_topic']}\n"
+            f"🆔 <b>Msg ID:</b> {sent_message.message_id}\n"
+            f"🔗 <a href='{entry['vault_link']}'>Open Stored File</a>"
+        )
+
+        send_admin_log(log_text)
+
+    except Exception as e:
+        print("Registry log error:", e)
+
+# ================================
+# ROUTE WORKER
+# ================================
 def route_worker(route):
     key = get_route_key(route)
     q = route_queues[key]
 
     while True:
         message = q.get()
-
         try:
             delay = route.get("delay", 0)
             time.sleep(delay)
 
             src_chat = message.chat.id
-            prefix = route.get("prefix", "")
 
-            original_caption = ""
-            if hasattr(message, "caption") and message.caption:
-                original_caption = message.caption
-            elif hasattr(message, "text") and message.text:
-                original_caption = message.text
-
-            final_caption = f"{prefix}{original_caption}" if prefix else original_caption
-
-            # TEXT MESSAGE = SEND CUSTOM PREFIX POSSIBLE
-            if message.content_type == "text":
-                if route["dest_topic"] is not None:
-                    sent = bot.send_message(
-                        route["dest_chat"],
-                        final_caption,
-                        message_thread_id=route["dest_topic"]
-                    )
-                else:
-                    sent = bot.send_message(
-                        route["dest_chat"],
-                        final_caption
-                    )
-
-            # MEDIA MESSAGE = COPY NORMAL
+            if route["dest_topic"] is not None:
+                sent = bot.copy_message(
+                    chat_id=route["dest_chat"],
+                    from_chat_id=src_chat,
+                    message_id=message.message_id,
+                    message_thread_id=route["dest_topic"]
+                )
             else:
-                if route["dest_topic"] is not None:
-                    sent = bot.copy_message(
-                        chat_id=route["dest_chat"],
-                        from_chat_id=src_chat,
-                        message_id=message.message_id,
-                        message_thread_id=route["dest_topic"]
-                    )
-                else:
-                    sent = bot.copy_message(
-                        chat_id=route["dest_chat"],
-                        from_chat_id=src_chat,
-                        message_id=message.message_id
-                    )
+                sent = bot.copy_message(
+                    chat_id=route["dest_chat"],
+                    from_chat_id=src_chat,
+                    message_id=message.message_id
+                )
 
             recent_relays.add(f"{route['dest_chat']}:{route['dest_topic']}:{sent.message_id}")
+
+            # SAVE EVERY DESTINATION COPY INTO REGISTRY
+            log_to_registry(message, route, sent)
 
         except Exception as e:
             print("Queue worker copy error:", e)
 
         q.task_done()
 
+# ================================
+# ENSURE THREAD WORKER
+# ================================
 def ensure_worker(route):
     key = get_route_key(route)
 
@@ -152,125 +200,41 @@ def ensure_worker(route):
         t.start()
         route_workers[key] = t
 
-# ==============================
-# START PANEL
-# ==============================
-
+# ================================
+# START COMMAND
+# ================================
 @bot.message_handler(commands=['start'])
 def start_cmd(message):
-    txt = """<b>TSD AUTOFORWARD PRO CONSOLE</b>
+    if not is_admin(message):
+        return
 
-Intelligent Telegram Routing & Mirroring Utility
+    txt = (
+        "✅ <b>RelayMaster V2 MedicalVault Edition Online</b>\n\n"
+        "/whoami - show telegram user id\n"
+        "/id - get current chat and topic id\n"
+        "/addroute sourcechat sourcetopic destchat desttopic delay\n"
+        "/routes - show all active routes\n"
+        "/delroute number\n"
+        "/clearall - delete all routes\n"
+        "/registrycount - total stored files in registry"
+    )
+    bot.reply_to(message, txt)
 
-------------------------------
-• Topic ↔ Topic Relay
-• Group ↔ Channel Forwarding
-• Sequential Delay Queue Engine
-• Caption Prefix Management
-• Route Status Controller
-• Live Route Statistics
-------------------------------
-
-<b>System Status:</b> 🟢 ONLINE
-
-Use the control panel below."""
-
-    bot.send_message(message.chat.id, txt, reply_markup=main_panel())
-
-# ==============================
-# CALLBACK CONTROL PANEL
-# ==============================
-
-@bot.callback_query_handler(func=lambda call: True)
-def callback_router(call):
-    global ROUTES, user_sessions
-
-    try:
-        uid = call.from_user.id
-
-        if call.data == "viewroutes":
-            if not ROUTES:
-                bot.answer_callback_query(call.id, "No routes configured.")
-                return
-
-            txt = "📡 <b>ACTIVE ROUTING TABLE</b>\n\n"
-
-            for i, r in enumerate(ROUTES, start=1):
-                state = "🟢 ON" if r.get("enabled", True) else "🔴 OFF"
-
-                txt += (
-                    f"{i}. {state}\n"
-                    f"FROM: {r['source_chat']} | {r['source_topic']}\n"
-                    f"TO: {r['dest_chat']} | {r['dest_topic']}\n"
-                    f"DELAY: {r.get('delay',0)} sec\n"
-                    f"PREFIX: {r.get('prefix','(none)')}\n\n"
-                )
-
-            bot.send_message(call.message.chat.id, txt)
-
-        elif call.data == "stats":
-            total = len(ROUTES)
-            active = len([r for r in ROUTES if r.get("enabled", True)])
-            paused = total - active
-
-            txt = (
-                "📊 <b>TSD ROUTE LOG PANEL</b>\n\n"
-                f"Total Routes: {total}\n"
-                f"Active Routes: {active}\n"
-                f"Paused Routes: {paused}\n"
-                f"Queue Workers Running: {len(route_workers)}"
-            )
-
-            bot.send_message(call.message.chat.id, txt)
-
-        elif call.data == "addroute":
-            user_sessions[uid] = {"mode": "addroute_step1"}
-            save_sessions()
-            bot.send_message(call.message.chat.id, "➕ Send SOURCE CHAT ID")
-
-        elif call.data == "toggle":
-            if not ROUTES:
-                bot.answer_callback_query(call.id, "No routes available.")
-                return
-
-            user_sessions[uid] = {"mode": "toggle_route"}
-            save_sessions()
-            bot.send_message(call.message.chat.id, "⏯ Send route number to toggle")
-
-        elif call.data == "delete":
-            if not ROUTES:
-                bot.answer_callback_query(call.id, "No routes available.")
-                return
-
-            user_sessions[uid] = {"mode": "delete_route"}
-            save_sessions()
-            bot.send_message(call.message.chat.id, "🗑 Send route number to delete")
-
-        elif call.data == "caption":
-            if not ROUTES:
-                bot.answer_callback_query(call.id, "No routes available.")
-                return
-
-            user_sessions[uid] = {"mode": "caption_route_select"}
-            save_sessions()
-            bot.send_message(call.message.chat.id, "📝 Send route number to set prefix")
-
-        else:
-            bot.answer_callback_query(call.id, "Unknown action.")
-
-    except Exception as e:
-        print("Callback error:", e)
-
-# ==============================
-# MANUAL COMMANDS
-# ==============================
-
+# ================================
+# WHOAMI
+# ================================
 @bot.message_handler(commands=['whoami'])
 def whoami_cmd(message):
     bot.reply_to(message, f"👤 YOUR TELEGRAM ID: <code>{message.from_user.id}</code>")
 
+# ================================
+# ID COMMAND
+# ================================
 @bot.message_handler(commands=['id'])
 def id_cmd(message):
+    if not is_admin(message):
+        return
+
     chat_id = message.chat.id
     topic_id = getattr(message, "message_thread_id", None)
 
@@ -279,9 +243,15 @@ def id_cmd(message):
         f"🆔 CHAT ID: <code>{chat_id}</code>\n🧵 TOPIC ID: <code>{topic_id}</code>"
     )
 
+# ================================
+# ADD ROUTE
+# ================================
 @bot.message_handler(commands=['addroute'])
 def add_route(message):
     global ROUTES
+
+    if not is_admin(message):
+        return
 
     try:
         parts = message.text.split()
@@ -297,21 +267,14 @@ def add_route(message):
             "source_topic": source_topic,
             "dest_chat": dest_chat,
             "dest_topic": dest_topic,
-            "delay": delay,
-            "enabled": True,
-            "prefix": "",
-            "strip_caption": False
+            "delay": delay
         }
 
         ROUTES.append(new_route)
         save_routes(ROUTES)
         ensure_worker(new_route)
 
-        bot.reply_to(message, "✅ Portable route added successfully.")
-
-        if message.from_user.id in user_sessions:
-            del user_sessions[message.from_user.id]
-            save_sessions()
+        bot.reply_to(message, "✅ New MedicalVault route added successfully.")
 
     except Exception as e:
         bot.reply_to(
@@ -319,27 +282,38 @@ def add_route(message):
             f"❌ Usage:\n/addroute sourcechat sourcetopic destchat desttopic delay\n\nError: {e}"
         )
 
+# ================================
+# SHOW ROUTES
+# ================================
 @bot.message_handler(commands=['routes'])
 def show_routes(message):
-    if not ROUTES:
-        bot.reply_to(message, "No routes configured.")
+    if not is_admin(message):
         return
 
-    txt = "📡 ACTIVE PORTABLE ROUTES:\n\n"
+    if not ROUTES:
+        bot.reply_to(message, "No active routes configured.")
+        return
+
+    txt = "📡 <b>ACTIVE MEDICALVAULT ROUTES</b>\n\n"
 
     for i, r in enumerate(ROUTES, start=1):
         txt += (
             f"{i}. FROM: {r['source_chat']} | Topic: {r['source_topic']}\n"
             f"TO: {r['dest_chat']} | Topic: {r['dest_topic']}\n"
-            f"DELAY: {r.get('delay',0)} sec\n"
-            f"PREFIX: {r.get('prefix','(none)')}\n\n"
+            f"DELAY: {r.get('delay',0)} sec\n\n"
         )
 
     bot.reply_to(message, txt)
 
+# ================================
+# DELETE ROUTE
+# ================================
 @bot.message_handler(commands=['delroute'])
 def del_route(message):
     global ROUTES
+
+    if not is_admin(message):
+        return
 
     try:
         num = int(message.text.split()[1]) - 1
@@ -354,148 +328,37 @@ def del_route(message):
     except:
         bot.reply_to(message, "Usage: /delroute number")
 
+# ================================
+# CLEAR ALL ROUTES
+# ================================
 @bot.message_handler(commands=['clearall'])
 def clear_all(message):
-    global ROUTES, route_queues, route_workers, user_sessions
+    global ROUTES, route_queues, route_workers
+
+    if not is_admin(message):
+        return
 
     ROUTES = []
     route_queues = {}
     route_workers = {}
-    user_sessions.clear()
-
     save_routes(ROUTES)
-    save_sessions()
 
     bot.reply_to(message, "🗑 All routes cleared.")
 
-# ==============================
-# USER SESSION PROCESSOR
-# ==============================
+# ================================
+# REGISTRY COUNT
+# ================================
+@bot.message_handler(commands=['registrycount'])
+def registry_count(message):
+    if not is_admin(message):
+        return
 
-def process_user_session(message):
-    global user_sessions, ROUTES
+    total = len(VAULT_REGISTRY)
+    bot.reply_to(message, f"📚 Total stored files in registry: <b>{total}</b>")
 
-    uid = message.from_user.id
-
-    if uid not in user_sessions:
-        return False
-
-    session = user_sessions[uid]
-    mode = session["mode"]
-
-    try:
-
-        # ADD ROUTE STEP 1
-        if mode == "addroute_step1":
-            session["source_chat"] = int(message.text)
-            session["mode"] = "addroute_step2"
-            save_sessions()
-            bot.reply_to(message, "Send SOURCE TOPIC ID (or type none)")
-
-        # ADD ROUTE STEP 2
-        elif mode == "addroute_step2":
-            session["source_topic"] = None if message.text.lower() == "none" else int(message.text)
-            session["mode"] = "addroute_step3"
-            save_sessions()
-            bot.reply_to(message, "Send DESTINATION CHAT ID")
-
-        # ADD ROUTE STEP 3
-        elif mode == "addroute_step3":
-            session["dest_chat"] = int(message.text)
-            session["mode"] = "addroute_step4"
-            save_sessions()
-            bot.reply_to(message, "Send DESTINATION TOPIC ID (or type none)")
-
-        # ADD ROUTE STEP 4
-        elif mode == "addroute_step4":
-            session["dest_topic"] = None if message.text.lower() == "none" else int(message.text)
-            session["mode"] = "addroute_step5"
-            save_sessions()
-            bot.reply_to(message, "Send DELAY in seconds")
-
-        # ADD ROUTE STEP 5
-        elif mode == "addroute_step5":
-            delay = int(message.text)
-
-            new_route = {
-                "source_chat": session["source_chat"],
-                "source_topic": session["source_topic"],
-                "dest_chat": session["dest_chat"],
-                "dest_topic": session["dest_topic"],
-                "delay": delay,
-                "enabled": True,
-                "prefix": "",
-                "strip_caption": False
-            }
-
-            ROUTES.append(new_route)
-            save_routes(ROUTES)
-            ensure_worker(new_route)
-
-            bot.reply_to(message, "✅ New route created from control panel.")
-
-            del user_sessions[uid]
-            save_sessions()
-
-        # TOGGLE ROUTE
-        elif mode == "toggle_route":
-            num = int(message.text) - 1
-
-            if 0 <= num < len(ROUTES):
-                ROUTES[num]["enabled"] = not ROUTES[num].get("enabled", True)
-                save_routes(ROUTES)
-
-                state = "ON" if ROUTES[num]["enabled"] else "OFF"
-                bot.reply_to(message, f"⏯ Route {num+1} switched {state}")
-
-            del user_sessions[uid]
-            save_sessions()
-
-        # DELETE ROUTE
-        elif mode == "delete_route":
-            num = int(message.text) - 1
-
-            if 0 <= num < len(ROUTES):
-                ROUTES.pop(num)
-                save_routes(ROUTES)
-                bot.reply_to(message, "🗑 Route deleted successfully.")
-
-            del user_sessions[uid]
-            save_sessions()
-
-        # CAPTION PREFIX SELECT
-        elif mode == "caption_route_select":
-            num = int(message.text) - 1
-            session["route_num"] = num
-            session["mode"] = "caption_route_write"
-            save_sessions()
-            bot.reply_to(message, "Send prefix text to add before every text message")
-
-        # CAPTION PREFIX WRITE
-        elif mode == "caption_route_write":
-            num = session["route_num"]
-
-            if 0 <= num < len(ROUTES):
-                ROUTES[num]["prefix"] = message.text
-                save_routes(ROUTES)
-                bot.reply_to(message, "📝 Prefix saved successfully.")
-
-            del user_sessions[uid]
-            save_sessions()
-
-    except Exception as e:
-        bot.reply_to(message, f"❌ Session Error: {e}")
-
-        if uid in user_sessions:
-            del user_sessions[uid]
-            save_sessions()
-
-    return True
-
-# ==============================
-# RELAY PROCESSOR
-# ==============================
-
+# ================================
+# MAIN RELAY ENGINE
+# ================================
 def process_relay(message):
     global ROUTES, recent_relays
 
@@ -505,12 +368,15 @@ def process_relay(message):
 
         signature = f"{src_chat}:{src_topic}:{message.message_id}"
 
+        # STRONG DUPLICATE LOOP PROTECTION
         if signature in recent_relays:
             return
 
+        # CLEAN OLD DUPLICATE CACHE PERIODICALLY
+        if len(recent_relays) > 5000:
+            recent_relays = set(list(recent_relays)[-1000:])
+
         for route in ROUTES:
-            if not route.get("enabled", True):
-                continue
 
             if src_chat != route["source_chat"]:
                 continue
@@ -525,29 +391,47 @@ def process_relay(message):
     except Exception as e:
         print("Relay engine error:", e)
 
-# ==============================
-# UNIVERSAL HANDLERS
-# ==============================
-
-@bot.message_handler(func=lambda m: True, content_types=[
-    'text','photo','video','document','audio','voice','sticker','animation'
-])
+# ================================
+# UNIVERSAL PRIVATE/GROUP MESSAGE HANDLER
+# ================================
+@bot.message_handler(
+    func=lambda m: True,
+    content_types=[
+        'text',
+        'photo',
+        'video',
+        'document',
+        'audio',
+        'voice',
+        'sticker',
+        'animation'
+    ]
+)
 def universal_handler(message):
-    if process_user_session(message):
-        return
-
     process_relay(message)
 
-@bot.channel_post_handler(func=lambda m: True, content_types=[
-    'text','photo','video','document','audio','voice','sticker','animation'
-])
+# ================================
+# CHANNEL POST HANDLER
+# ================================
+@bot.channel_post_handler(
+    func=lambda m: True,
+    content_types=[
+        'text',
+        'photo',
+        'video',
+        'document',
+        'audio',
+        'voice',
+        'sticker',
+        'animation'
+    ]
+)
 def channel_handler(message):
     process_relay(message)
 
-# ==============================
-# WEBHOOK
-# ==============================
-
+# ================================
+# WEBHOOK RECEIVER
+# ================================
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
     try:
@@ -561,13 +445,24 @@ def webhook():
         traceback.print_exc()
         return "error", 500
 
+# ================================
+# HOME CHECK
+# ================================
 @app.route("/")
 def home():
-    return "RelayMaster Portable Final Running"
+    return "RelayMaster V2 MedicalVault Running"
 
-# ==============================
-# RUN SERVER
-# ==============================
+# ================================
+# START ALL SAVED ROUTE WORKERS
+# ================================
+for route in ROUTES:
+    ensure_worker(route)
 
+# ================================
+# RUN APP
+# ================================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000))
+    )
