@@ -15,10 +15,16 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=False)
 app = Flask(__name__)
 
 ROUTE_FILE = "routes.json"
+SESSION_FILE = "sessions.json"
+
 recent_relays = set()
 route_queues = {}
 route_workers = {}
 user_sessions = {}
+
+# ==============================
+# FILE LOAD / SAVE SYSTEM
+# ==============================
 
 def load_routes():
     try:
@@ -31,11 +37,32 @@ def save_routes(routes):
     with open(ROUTE_FILE, "w", encoding="utf-8") as f:
         json.dump(routes, f, indent=4)
 
+def load_sessions():
+    try:
+        with open(SESSION_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return {int(k): v for k, v in data.items()}
+    except:
+        return {}
+
+def save_sessions():
+    with open(SESSION_FILE, "w", encoding="utf-8") as f:
+        json.dump({str(k): v for k, v in user_sessions.items()}, f, indent=4)
+
 ROUTES = load_routes()
+user_sessions = load_sessions()
+
+# ==============================
+# ADMIN CHECK
+# ==============================
 
 def is_admin(message):
     return True
-    
+
+# ==============================
+# CONTROL PANEL UI
+# ==============================
+
 def main_panel():
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
@@ -48,6 +75,10 @@ def main_panel():
     )
     return kb
 
+# ==============================
+# ROUTE ENGINE HELPERS
+# ==============================
+
 def get_route_key(route):
     return f"{route['source_chat']}_{route['source_topic']}_{route['dest_chat']}_{route['dest_topic']}"
 
@@ -57,6 +88,7 @@ def route_worker(route):
 
     while True:
         message = q.get()
+
         try:
             delay = route.get("delay", 0)
             time.sleep(delay)
@@ -72,6 +104,7 @@ def route_worker(route):
 
             final_caption = f"{prefix}{original_caption}" if prefix else original_caption
 
+            # TEXT MESSAGE = SEND CUSTOM PREFIX POSSIBLE
             if message.content_type == "text":
                 if route["dest_topic"] is not None:
                     sent = bot.send_message(
@@ -85,6 +118,7 @@ def route_worker(route):
                         final_caption
                     )
 
+            # MEDIA MESSAGE = COPY NORMAL
             else:
                 if route["dest_topic"] is not None:
                     sent = bot.copy_message(
@@ -109,6 +143,7 @@ def route_worker(route):
 
 def ensure_worker(route):
     key = get_route_key(route)
+
     if key not in route_queues:
         route_queues[key] = Queue()
 
@@ -116,6 +151,10 @@ def ensure_worker(route):
         t = threading.Thread(target=route_worker, args=(route,), daemon=True)
         t.start()
         route_workers[key] = t
+
+# ==============================
+# START PANEL
+# ==============================
 
 @bot.message_handler(commands=['start'])
 def start_cmd(message):
@@ -135,8 +174,12 @@ Intelligent Telegram Routing & Mirroring Utility
 <b>System Status:</b> 🟢 ONLINE
 
 Use the control panel below."""
-    
+
     bot.send_message(message.chat.id, txt, reply_markup=main_panel())
+
+# ==============================
+# CALLBACK CONTROL PANEL
+# ==============================
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_router(call):
@@ -151,8 +194,10 @@ def callback_router(call):
                 return
 
             txt = "📡 <b>ACTIVE ROUTING TABLE</b>\n\n"
+
             for i, r in enumerate(ROUTES, start=1):
                 state = "🟢 ON" if r.get("enabled", True) else "🔴 OFF"
+
                 txt += (
                     f"{i}. {state}\n"
                     f"FROM: {r['source_chat']} | {r['source_topic']}\n"
@@ -160,6 +205,7 @@ def callback_router(call):
                     f"DELAY: {r.get('delay',0)} sec\n"
                     f"PREFIX: {r.get('prefix','(none)')}\n\n"
                 )
+
             bot.send_message(call.message.chat.id, txt)
 
         elif call.data == "stats":
@@ -174,32 +220,40 @@ def callback_router(call):
                 f"Paused Routes: {paused}\n"
                 f"Queue Workers Running: {len(route_workers)}"
             )
+
             bot.send_message(call.message.chat.id, txt)
 
         elif call.data == "addroute":
             user_sessions[uid] = {"mode": "addroute_step1"}
+            save_sessions()
             bot.send_message(call.message.chat.id, "➕ Send SOURCE CHAT ID")
 
         elif call.data == "toggle":
             if not ROUTES:
                 bot.answer_callback_query(call.id, "No routes available.")
                 return
+
             user_sessions[uid] = {"mode": "toggle_route"}
-            bot.send_message(call.message.chat.id, "⏯ Send route number to toggle ON/OFF")
+            save_sessions()
+            bot.send_message(call.message.chat.id, "⏯ Send route number to toggle")
 
         elif call.data == "delete":
             if not ROUTES:
                 bot.answer_callback_query(call.id, "No routes available.")
                 return
+
             user_sessions[uid] = {"mode": "delete_route"}
+            save_sessions()
             bot.send_message(call.message.chat.id, "🗑 Send route number to delete")
 
         elif call.data == "caption":
             if not ROUTES:
                 bot.answer_callback_query(call.id, "No routes available.")
                 return
+
             user_sessions[uid] = {"mode": "caption_route_select"}
-            bot.send_message(call.message.chat.id, "📝 Send route number to set caption prefix")
+            save_sessions()
+            bot.send_message(call.message.chat.id, "📝 Send route number to set prefix")
 
         else:
             bot.answer_callback_query(call.id, "Unknown action.")
@@ -207,25 +261,31 @@ def callback_router(call):
     except Exception as e:
         print("Callback error:", e)
 
+# ==============================
+# MANUAL COMMANDS
+# ==============================
+
 @bot.message_handler(commands=['whoami'])
 def whoami_cmd(message):
     bot.reply_to(message, f"👤 YOUR TELEGRAM ID: <code>{message.from_user.id}</code>")
 
 @bot.message_handler(commands=['id'])
 def id_cmd(message):
-    if not is_admin(message):
-        return
     chat_id = message.chat.id
     topic_id = getattr(message, "message_thread_id", None)
-    bot.reply_to(message, f"🆔 CHAT ID: <code>{chat_id}</code>\n🧵 TOPIC ID: <code>{topic_id}</code>")
+
+    bot.reply_to(
+        message,
+        f"🆔 CHAT ID: <code>{chat_id}</code>\n🧵 TOPIC ID: <code>{topic_id}</code>"
+    )
 
 @bot.message_handler(commands=['addroute'])
 def add_route(message):
     global ROUTES
-    if not is_admin(message):
-        return
+
     try:
         parts = message.text.split()
+
         source_chat = int(parts[1])
         source_topic = None if parts[2].lower() == "none" else int(parts[2])
         dest_chat = int(parts[3])
@@ -233,62 +293,85 @@ def add_route(message):
         delay = int(parts[5])
 
         new_route = {
-    "source_chat": source_chat,
-    "source_topic": source_topic,
-    "dest_chat": dest_chat,
-    "dest_topic": dest_topic,
-    "delay": delay,
-    "enabled": True,
-    "prefix": "",
-    "strip_caption": False
+            "source_chat": source_chat,
+            "source_topic": source_topic,
+            "dest_chat": dest_chat,
+            "dest_topic": dest_topic,
+            "delay": delay,
+            "enabled": True,
+            "prefix": "",
+            "strip_caption": False
         }
 
         ROUTES.append(new_route)
         save_routes(ROUTES)
         ensure_worker(new_route)
+
         bot.reply_to(message, "✅ Portable route added successfully.")
 
+        if message.from_user.id in user_sessions:
+            del user_sessions[message.from_user.id]
+            save_sessions()
+
     except Exception as e:
-        bot.reply_to(message, f"❌ Usage:\n/addroute sourcechat sourcetopic destchat desttopic delay\n\nError: {e}")
+        bot.reply_to(
+            message,
+            f"❌ Usage:\n/addroute sourcechat sourcetopic destchat desttopic delay\n\nError: {e}"
+        )
 
 @bot.message_handler(commands=['routes'])
 def show_routes(message):
-    if not is_admin(message):
-        return
     if not ROUTES:
         bot.reply_to(message, "No routes configured.")
         return
+
     txt = "📡 ACTIVE PORTABLE ROUTES:\n\n"
+
     for i, r in enumerate(ROUTES, start=1):
-        txt += f"{i}. FROM: {r['source_chat']} | Topic: {r['source_topic']}\nTO: {r['dest_chat']} | Topic: {r['dest_topic']}\nDELAY: {r.get('delay',0)} sec\n\n"
+        txt += (
+            f"{i}. FROM: {r['source_chat']} | Topic: {r['source_topic']}\n"
+            f"TO: {r['dest_chat']} | Topic: {r['dest_topic']}\n"
+            f"DELAY: {r.get('delay',0)} sec\n"
+            f"PREFIX: {r.get('prefix','(none)')}\n\n"
+        )
+
     bot.reply_to(message, txt)
 
 @bot.message_handler(commands=['delroute'])
 def del_route(message):
     global ROUTES
-    if not is_admin(message):
-        return
+
     try:
         num = int(message.text.split()[1]) - 1
+
         if 0 <= num < len(ROUTES):
             ROUTES.pop(num)
             save_routes(ROUTES)
             bot.reply_to(message, "🗑 Route deleted.")
         else:
             bot.reply_to(message, "❌ Invalid route number.")
+
     except:
         bot.reply_to(message, "Usage: /delroute number")
 
 @bot.message_handler(commands=['clearall'])
 def clear_all(message):
-    global ROUTES, route_queues, route_workers
-    if not is_admin(message):
-        return
+    global ROUTES, route_queues, route_workers, user_sessions
+
     ROUTES = []
     route_queues = {}
     route_workers = {}
+    user_sessions.clear()
+
     save_routes(ROUTES)
+    save_sessions()
+
     bot.reply_to(message, "🗑 All routes cleared.")
+
+# ==============================
+# USER SESSION PROCESSOR
+# ==============================
+
 def process_user_session(message):
     global user_sessions, ROUTES
 
@@ -301,27 +384,36 @@ def process_user_session(message):
     mode = session["mode"]
 
     try:
-        # ADD ROUTE WIZARD
+
+        # ADD ROUTE STEP 1
         if mode == "addroute_step1":
             session["source_chat"] = int(message.text)
             session["mode"] = "addroute_step2"
+            save_sessions()
             bot.reply_to(message, "Send SOURCE TOPIC ID (or type none)")
 
+        # ADD ROUTE STEP 2
         elif mode == "addroute_step2":
             session["source_topic"] = None if message.text.lower() == "none" else int(message.text)
             session["mode"] = "addroute_step3"
+            save_sessions()
             bot.reply_to(message, "Send DESTINATION CHAT ID")
 
+        # ADD ROUTE STEP 3
         elif mode == "addroute_step3":
             session["dest_chat"] = int(message.text)
             session["mode"] = "addroute_step4"
+            save_sessions()
             bot.reply_to(message, "Send DESTINATION TOPIC ID (or type none)")
 
+        # ADD ROUTE STEP 4
         elif mode == "addroute_step4":
             session["dest_topic"] = None if message.text.lower() == "none" else int(message.text)
             session["mode"] = "addroute_step5"
+            save_sessions()
             bot.reply_to(message, "Send DELAY in seconds")
 
+        # ADD ROUTE STEP 5
         elif mode == "addroute_step5":
             delay = int(message.text)
 
@@ -339,64 +431,90 @@ def process_user_session(message):
             ROUTES.append(new_route)
             save_routes(ROUTES)
             ensure_worker(new_route)
+
             bot.reply_to(message, "✅ New route created from control panel.")
+
             del user_sessions[uid]
+            save_sessions()
 
         # TOGGLE ROUTE
         elif mode == "toggle_route":
             num = int(message.text) - 1
+
             if 0 <= num < len(ROUTES):
                 ROUTES[num]["enabled"] = not ROUTES[num].get("enabled", True)
                 save_routes(ROUTES)
+
                 state = "ON" if ROUTES[num]["enabled"] else "OFF"
                 bot.reply_to(message, f"⏯ Route {num+1} switched {state}")
+
             del user_sessions[uid]
+            save_sessions()
 
         # DELETE ROUTE
         elif mode == "delete_route":
             num = int(message.text) - 1
+
             if 0 <= num < len(ROUTES):
                 ROUTES.pop(num)
                 save_routes(ROUTES)
                 bot.reply_to(message, "🗑 Route deleted successfully.")
-            del user_sessions[uid]
 
-        # CAPTION PREFIX
+            del user_sessions[uid]
+            save_sessions()
+
+        # CAPTION PREFIX SELECT
         elif mode == "caption_route_select":
             num = int(message.text) - 1
             session["route_num"] = num
             session["mode"] = "caption_route_write"
-            bot.reply_to(message, "Send prefix text to add before every caption")
+            save_sessions()
+            bot.reply_to(message, "Send prefix text to add before every text message")
 
+        # CAPTION PREFIX WRITE
         elif mode == "caption_route_write":
             num = session["route_num"]
+
             if 0 <= num < len(ROUTES):
                 ROUTES[num]["prefix"] = message.text
                 save_routes(ROUTES)
-                bot.reply_to(message, "📝 Caption prefix saved.")
+                bot.reply_to(message, "📝 Prefix saved successfully.")
+
             del user_sessions[uid]
+            save_sessions()
 
     except Exception as e:
         bot.reply_to(message, f"❌ Session Error: {e}")
+
         if uid in user_sessions:
             del user_sessions[uid]
+            save_sessions()
 
     return True
+
+# ==============================
+# RELAY PROCESSOR
+# ==============================
+
 def process_relay(message):
     global ROUTES, recent_relays
+
     try:
         src_chat = message.chat.id
         src_topic = getattr(message, "message_thread_id", None)
 
         signature = f"{src_chat}:{src_topic}:{message.message_id}"
+
         if signature in recent_relays:
             return
 
         for route in ROUTES:
             if not route.get("enabled", True):
                 continue
+
             if src_chat != route["source_chat"]:
                 continue
+
             if route["source_topic"] is not None and src_topic != route["source_topic"]:
                 continue
 
@@ -407,14 +525,28 @@ def process_relay(message):
     except Exception as e:
         print("Relay engine error:", e)
 
-@bot.message_handler(func=lambda m: True, content_types=['text','photo','video','document','audio','voice','sticker','animation'])
+# ==============================
+# UNIVERSAL HANDLERS
+# ==============================
+
+@bot.message_handler(func=lambda m: True, content_types=[
+    'text','photo','video','document','audio','voice','sticker','animation'
+])
 def universal_handler(message):
     if process_user_session(message):
         return
+
     process_relay(message)
-@bot.channel_post_handler(func=lambda m: True, content_types=['text','photo','video','document','audio','voice','sticker','animation'])
+
+@bot.channel_post_handler(func=lambda m: True, content_types=[
+    'text','photo','video','document','audio','voice','sticker','animation'
+])
 def channel_handler(message):
     process_relay(message)
+
+# ==============================
+# WEBHOOK
+# ==============================
 
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
@@ -423,6 +555,7 @@ def webhook():
         update = telebot.types.Update.de_json(json_str)
         bot.process_new_updates([update])
         return "ok", 200
+
     except Exception:
         print("WEBHOOK ERROR:")
         traceback.print_exc()
@@ -431,6 +564,10 @@ def webhook():
 @app.route("/")
 def home():
     return "RelayMaster Portable Final Running"
+
+# ==============================
+# RUN SERVER
+# ==============================
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
