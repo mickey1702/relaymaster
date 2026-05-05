@@ -6,6 +6,7 @@ import threading
 import time
 from queue import Queue
 from flask import Flask, request
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = str(os.getenv("ADMIN_ID", "0")).strip()
@@ -33,6 +34,17 @@ ROUTES = load_routes()
 
 def is_admin(message):
     return True
+def main_panel():
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("➕ Add Route", callback_data="addroute"),
+        InlineKeyboardButton("📡 View Routes", callback_data="viewroutes"),
+        InlineKeyboardButton("⏯ Toggle Route", callback_data="toggle"),
+        InlineKeyboardButton("🗑 Delete Route", callback_data="delete"),
+        InlineKeyboardButton("📝 Caption Mode", callback_data="caption"),
+        InlineKeyboardButton("📊 Log Panel", callback_data="stats")
+    )
+    return kb
 
 def get_route_key(route):
     return f"{route['source_chat']}_{route['source_topic']}_{route['dest_chat']}_{route['dest_topic']}"
@@ -82,9 +94,65 @@ def ensure_worker(route):
 
 @bot.message_handler(commands=['start'])
 def start_cmd(message):
-    if not is_admin(message):
-        return
-    bot.reply_to(message, "✅ RelayMaster PORTABLE Final Online\n\n/whoami - show your telegram id\n/id - Get current Chat ID and Topic ID\n/addroute sourcechat sourcetopic destchat desttopic delay\n/routes - Show all active routes\n/delroute number\n/clearall - Delete all routes")
+    txt = """<b>TSD AUTOFORWARD PRO CONSOLE</b>
+
+Intelligent Telegram Routing & Mirroring Utility
+
+------------------------------
+• Topic ↔ Topic Relay
+• Group ↔ Channel Forwarding
+• Sequential Delay Queue Engine
+• Caption Prefix Management
+• Route Status Controller
+• Live Route Statistics
+------------------------------
+
+<b>System Status:</b> 🟢 ONLINE
+
+Use the control panel below."""
+    
+    bot.send_message(message.chat.id, txt, reply_markup=main_panel())
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_router(call):
+    global ROUTES
+
+    try:
+        if call.data == "viewroutes":
+            if not ROUTES:
+                bot.answer_callback_query(call.id, "No routes configured.")
+                return
+
+            txt = "📡 <b>ACTIVE ROUTING TABLE</b>\n\n"
+            for i, r in enumerate(ROUTES, start=1):
+                state = "🟢 ON" if r.get("enabled", True) else "🔴 OFF"
+                txt += (
+                    f"{i}. {state}\n"
+                    f"FROM: {r['source_chat']} | {r['source_topic']}\n"
+                    f"TO: {r['dest_chat']} | {r['dest_topic']}\n"
+                    f"DELAY: {r.get('delay',0)} sec\n\n"
+                )
+            bot.send_message(call.message.chat.id, txt)
+
+        elif call.data == "stats":
+            total = len(ROUTES)
+            active = len([r for r in ROUTES if r.get("enabled", True)])
+            paused = total - active
+
+            txt = (
+                "📊 <b>TSD ROUTE LOG PANEL</b>\n\n"
+                f"Total Routes: {total}\n"
+                f"Active Routes: {active}\n"
+                f"Paused Routes: {paused}\n"
+                f"Queue Workers Running: {len(route_workers)}"
+            )
+            bot.send_message(call.message.chat.id, txt)
+
+        else:
+            bot.answer_callback_query(call.id, "Module activates in next upgrade.")
+
+    except Exception as e:
+        print("Callback error:", e)
 
 @bot.message_handler(commands=['whoami'])
 def whoami_cmd(message):
@@ -112,11 +180,14 @@ def add_route(message):
         delay = int(parts[5])
 
         new_route = {
-            "source_chat": source_chat,
-            "source_topic": source_topic,
-            "dest_chat": dest_chat,
-            "dest_topic": dest_topic,
-            "delay": delay
+    "source_chat": source_chat,
+    "source_topic": source_topic,
+    "dest_chat": dest_chat,
+    "dest_topic": dest_topic,
+    "delay": delay,
+    "enabled": True,
+    "prefix": "",
+    "strip_caption": False
         }
 
         ROUTES.append(new_route)
@@ -177,6 +248,8 @@ def process_relay(message):
             return
 
         for route in ROUTES:
+            if not route.get("enabled", True):
+                continue
             if src_chat != route["source_chat"]:
                 continue
             if route["source_topic"] is not None and src_topic != route["source_topic"]:
