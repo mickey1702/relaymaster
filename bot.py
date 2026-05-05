@@ -18,6 +18,7 @@ ROUTE_FILE = "routes.json"
 recent_relays = set()
 route_queues = {}
 route_workers = {}
+user_sessions = {}
 
 def load_routes():
     try:
@@ -34,6 +35,7 @@ ROUTES = load_routes()
 
 def is_admin(message):
     return True
+    
 def main_panel():
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
@@ -60,20 +62,43 @@ def route_worker(route):
             time.sleep(delay)
 
             src_chat = message.chat.id
+            prefix = route.get("prefix", "")
 
-            if route["dest_topic"] is not None:
-                sent = bot.copy_message(
-                    chat_id=route["dest_chat"],
-                    from_chat_id=src_chat,
-                    message_id=message.message_id,
-                    message_thread_id=route["dest_topic"]
-                )
+            original_caption = ""
+            if hasattr(message, "caption") and message.caption:
+                original_caption = message.caption
+            elif hasattr(message, "text") and message.text:
+                original_caption = message.text
+
+            final_caption = f"{prefix}{original_caption}" if prefix else original_caption
+
+            if message.content_type == "text":
+                if route["dest_topic"] is not None:
+                    sent = bot.send_message(
+                        route["dest_chat"],
+                        final_caption,
+                        message_thread_id=route["dest_topic"]
+                    )
+                else:
+                    sent = bot.send_message(
+                        route["dest_chat"],
+                        final_caption
+                    )
+
             else:
-                sent = bot.copy_message(
-                    chat_id=route["dest_chat"],
-                    from_chat_id=src_chat,
-                    message_id=message.message_id
-                )
+                if route["dest_topic"] is not None:
+                    sent = bot.copy_message(
+                        chat_id=route["dest_chat"],
+                        from_chat_id=src_chat,
+                        message_id=message.message_id,
+                        message_thread_id=route["dest_topic"]
+                    )
+                else:
+                    sent = bot.copy_message(
+                        chat_id=route["dest_chat"],
+                        from_chat_id=src_chat,
+                        message_id=message.message_id
+                    )
 
             recent_relays.add(f"{route['dest_chat']}:{route['dest_topic']}:{sent.message_id}")
 
@@ -115,9 +140,11 @@ Use the control panel below."""
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_router(call):
-    global ROUTES
+    global ROUTES, user_sessions
 
     try:
+        uid = call.from_user.id
+
         if call.data == "viewroutes":
             if not ROUTES:
                 bot.answer_callback_query(call.id, "No routes configured.")
@@ -130,7 +157,8 @@ def callback_router(call):
                     f"{i}. {state}\n"
                     f"FROM: {r['source_chat']} | {r['source_topic']}\n"
                     f"TO: {r['dest_chat']} | {r['dest_topic']}\n"
-                    f"DELAY: {r.get('delay',0)} sec\n\n"
+                    f"DELAY: {r.get('delay',0)} sec\n"
+                    f"PREFIX: {r.get('prefix','(none)')}\n\n"
                 )
             bot.send_message(call.message.chat.id, txt)
 
@@ -148,8 +176,33 @@ def callback_router(call):
             )
             bot.send_message(call.message.chat.id, txt)
 
+        elif call.data == "addroute":
+            user_sessions[uid] = {"mode": "addroute_step1"}
+            bot.send_message(call.message.chat.id, "➕ Send SOURCE CHAT ID")
+
+        elif call.data == "toggle":
+            if not ROUTES:
+                bot.answer_callback_query(call.id, "No routes available.")
+                return
+            user_sessions[uid] = {"mode": "toggle_route"}
+            bot.send_message(call.message.chat.id, "⏯ Send route number to toggle ON/OFF")
+
+        elif call.data == "delete":
+            if not ROUTES:
+                bot.answer_callback_query(call.id, "No routes available.")
+                return
+            user_sessions[uid] = {"mode": "delete_route"}
+            bot.send_message(call.message.chat.id, "🗑 Send route number to delete")
+
+        elif call.data == "caption":
+            if not ROUTES:
+                bot.answer_callback_query(call.id, "No routes available.")
+                return
+            user_sessions[uid] = {"mode": "caption_route_select"}
+            bot.send_message(call.message.chat.id, "📝 Send route number to set caption prefix")
+
         else:
-            bot.answer_callback_query(call.id, "Module activates in next upgrade.")
+            bot.answer_callback_query(call.id, "Unknown action.")
 
     except Exception as e:
         print("Callback error:", e)
@@ -236,7 +289,99 @@ def clear_all(message):
     route_workers = {}
     save_routes(ROUTES)
     bot.reply_to(message, "🗑 All routes cleared.")
+def process_user_session(message):
+    global user_sessions, ROUTES
 
+    uid = message.from_user.id
+
+    if uid not in user_sessions:
+        return False
+
+    session = user_sessions[uid]
+    mode = session["mode"]
+
+    try:
+        # ADD ROUTE WIZARD
+        if mode == "addroute_step1":
+            session["source_chat"] = int(message.text)
+            session["mode"] = "addroute_step2"
+            bot.reply_to(message, "Send SOURCE TOPIC ID (or type none)")
+
+        elif mode == "addroute_step2":
+            session["source_topic"] = None if message.text.lower() == "none" else int(message.text)
+            session["mode"] = "addroute_step3"
+            bot.reply_to(message, "Send DESTINATION CHAT ID")
+
+        elif mode == "addroute_step3":
+            session["dest_chat"] = int(message.text)
+            session["mode"] = "addroute_step4"
+            bot.reply_to(message, "Send DESTINATION TOPIC ID (or type none)")
+
+        elif mode == "addroute_step4":
+            session["dest_topic"] = None if message.text.lower() == "none" else int(message.text)
+            session["mode"] = "addroute_step5"
+            bot.reply_to(message, "Send DELAY in seconds")
+
+        elif mode == "addroute_step5":
+            delay = int(message.text)
+
+            new_route = {
+                "source_chat": session["source_chat"],
+                "source_topic": session["source_topic"],
+                "dest_chat": session["dest_chat"],
+                "dest_topic": session["dest_topic"],
+                "delay": delay,
+                "enabled": True,
+                "prefix": "",
+                "strip_caption": False
+            }
+
+            ROUTES.append(new_route)
+            save_routes(ROUTES)
+            ensure_worker(new_route)
+            bot.reply_to(message, "✅ New route created from control panel.")
+            del user_sessions[uid]
+
+        # TOGGLE ROUTE
+        elif mode == "toggle_route":
+            num = int(message.text) - 1
+            if 0 <= num < len(ROUTES):
+                ROUTES[num]["enabled"] = not ROUTES[num].get("enabled", True)
+                save_routes(ROUTES)
+                state = "ON" if ROUTES[num]["enabled"] else "OFF"
+                bot.reply_to(message, f"⏯ Route {num+1} switched {state}")
+            del user_sessions[uid]
+
+        # DELETE ROUTE
+        elif mode == "delete_route":
+            num = int(message.text) - 1
+            if 0 <= num < len(ROUTES):
+                ROUTES.pop(num)
+                save_routes(ROUTES)
+                bot.reply_to(message, "🗑 Route deleted successfully.")
+            del user_sessions[uid]
+
+        # CAPTION PREFIX
+        elif mode == "caption_route_select":
+            num = int(message.text) - 1
+            session["route_num"] = num
+            session["mode"] = "caption_route_write"
+            bot.reply_to(message, "Send prefix text to add before every caption")
+
+        elif mode == "caption_route_write":
+            num = session["route_num"]
+            if 0 <= num < len(ROUTES):
+                ROUTES[num]["prefix"] = message.text
+                save_routes(ROUTES)
+                bot.reply_to(message, "📝 Caption prefix saved.")
+            del user_sessions[uid]
+
+    except Exception as e:
+        bot.reply_to(message, f"❌ Session Error: {e}")
+        if uid in user_sessions:
+            del user_sessions[uid]
+
+    return True
 def process_relay(message):
     global ROUTES, recent_relays
     try:
@@ -264,8 +409,9 @@ def process_relay(message):
 
 @bot.message_handler(func=lambda m: True, content_types=['text','photo','video','document','audio','voice','sticker','animation'])
 def universal_handler(message):
+    if process_user_session(message):
+        return
     process_relay(message)
-
 @bot.channel_post_handler(func=lambda m: True, content_types=['text','photo','video','document','audio','voice','sticker','animation'])
 def channel_handler(message):
     process_relay(message)
